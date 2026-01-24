@@ -1,14 +1,9 @@
 {
-  "name": "zion-brain",
+  "name": "zion-exec",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
   "dependencies": {
-    "@google/generative-ai": "^0.19.0",
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
+    "@google/genai": "^1.0.0"
   }
 }
