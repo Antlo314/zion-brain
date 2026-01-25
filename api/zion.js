@@ -1,94 +1,68 @@
-// /api/zion.js
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-export const config = { runtime: "nodejs" };
+export const config = {
+  runtime: "nodejs",
+};
 
-const MODEL = "gemini-3-pro-preview";
-const BUILD = "ZION_API_BUILD_2026-01-24_CANONICAL_QCOUNT_v1";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
 
-// Hard contract validator: never allow anything else back to the client
-function coerceToContract(raw) {
-  const out = {
-    reply: "",
-    next_question: "",
-    capture_intent: "none",
-  };
+/**
+ * CORS:
+ * - Browsers (GHL) require OPTIONS preflight to succeed.
+ * - curl does not. That’s why curl works and the site fails.
+ *
+ * If you want to restrict origins later, set:
+ *   CORS_ORIGIN=https://lumenlabsatl.com
+ * or a comma-separated list:
+ *   CORS_ORIGIN=https://lumenlabsatl.com,https://www.lumenlabsatl.com
+ */
+function applyCors(req, res) {
+  const configured = process.env.CORS_ORIGIN;
+  const origin = req.headers.origin;
 
+  let allowOrigin = "*";
+  if (configured && origin) {
+    const allowed = configured
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (allowed.includes(origin)) allowOrigin = origin;
+    else allowOrigin = allowed[0] || "*";
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  res.setHeader("Cache-Control", "no-store");
+}
+
+function safeJsonParse(input) {
   try {
-    if (typeof raw === "string") {
-      const maybe = JSON.parse(raw);
-      raw = maybe;
-    }
+    if (typeof input === "string") return JSON.parse(input);
+    return input || {};
   } catch {
-    // ignore
+    return null;
   }
-
-  if (raw && typeof raw === "object") {
-    if (typeof raw.reply === "string") out.reply = raw.reply.trim();
-    if (typeof raw.next_question === "string") out.next_question = raw.next_question.trim();
-
-    if (raw.capture_intent === "ask_contact" || raw.capture_intent === "none") {
-      out.capture_intent = raw.capture_intent;
-    }
-  }
-
-  // Failsafes
-  if (!out.reply) out.reply = "Understood. Tell me a bit more so I can point you in the right direction.";
-  if (!out.next_question) out.next_question = "What are you trying to achieve in the next 30 days?";
-  if (out.capture_intent !== "ask_contact" && out.capture_intent !== "none") out.capture_intent = "none";
-
-  return out;
-}
-
-function shouldForceCapture(qCount) {
-  // qCount = number of questions already asked so far (tracked client-side)
-  // Force capture once they've hit 2 questions (the next step would exceed 3 total).
-  return Number.isFinite(qCount) && qCount >= 2;
-}
-
-function isCommercialIntent(text = "") {
-  const t = String(text).toLowerCase();
-  const keys = [
-    "website",
-    "site",
-    "smart site",
-    "seo",
-    "automation",
-    "automations",
-    "leads",
-    "lead",
-    "ads",
-    "marketing",
-    "crm",
-    "pipeline",
-    "booking",
-    "appointment",
-    "ai agent",
-    "voice agent",
-    "go high level",
-    "gohighlevel",
-    "ghl",
-    "funnel",
-    "sales",
-    "growth",
-    "operations",
-    "workflow",
-    "sms",
-    "campaign",
-    "budget",
-    "$",
-  ];
-  return keys.some((k) => t.includes(k));
 }
 
 export default async function handler(req, res) {
   try {
+    applyCors(req, res);
+
+    // Handle browser preflight
+    if (req.method === "OPTIONS") {
+      return res.status(204).end();
+    }
+
     if (req.method === "GET") {
       return res.status(200).json({
         status: "ok",
         message: "Zion API is live. Use POST.",
         model: MODEL,
-        build: BUILD,
+        build: "ZION_API_BUILD_2026-01-24_CANONICAL_QCOUNT_v1",
       });
     }
 
@@ -97,36 +71,31 @@ export default async function handler(req, res) {
     }
 
     if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
+      return res.status(500).json({
+        error: "Zion execution failed",
+        details: "Missing GEMINI_API_KEY",
+      });
     }
 
-    // Parse body safely
-    let body = req.body;
-    if (typeof body === "string") {
-      try {
-        body = JSON.parse(body);
-      } catch {
-        // ignore
-      }
+    const body = safeJsonParse(req.body);
+    if (!body) {
+      return res.status(400).json({ error: "Invalid JSON body" });
     }
 
-    const message = String(body?.message ?? "");
-    const session_id = String(body?.session_id ?? "anon");
-    const transcript = String(body?.transcript ?? "");
-    const q_count = Number(body?.q_count ?? 0);
+    const message = (body.message || "").trim();
+    const session_id = (body.session_id || "").trim();
+    const transcript = Array.isArray(body.transcript) ? body.transcript : [];
+    const q_count = Number.isFinite(Number(body.q_count)) ? Number(body.q_count) : null;
 
-    if (!message.trim()) {
+    if (!message) {
       return res.status(400).json({ error: "Missing message" });
     }
 
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: MODEL });
-
+    // SYSTEM PROMPT (keep aligned with your Zion direction)
     const SYSTEM_PROMPT = `
-You are Zion, the executive intelligence for Lumen Labs (AI growth systems studio).
-You are not “Gemini,” not “Google,” not a chatbot. Do not mention model/provider identity.
-
-Output MUST be valid JSON only, with EXACT keys:
+You are Zion — executive intelligence for Lumen Labs (AI growth systems studio).
+Tone: calm, precise, operator-grade. No fluff. No hype.
+You must respond ONLY in valid JSON with this schema:
 {
   "reply": "string",
   "next_question": "string",
@@ -134,66 +103,83 @@ Output MUST be valid JSON only, with EXACT keys:
 }
 
 Rules:
-- Ask at most 3 questions total before triggering lead capture.
-- The user's current question count is provided as q_count (questions already asked). If q_count >= 2, you MUST set capture_intent to "ask_contact" now.
-- If the user's message shows commercial intent, you SHOULD set capture_intent to "ask_contact" by q_count 1 at the latest.
-- Prefer early capture when intent is commercial (business, brand, website, automation, SEO, leads, ads, CRM, operations).
-- Keep tone calm, executive, concise.
-- If you set capture_intent to "ask_contact", next_question MUST ask for name + email + phone in one prompt.
-- Never output markdown. Never add extra keys. Never wrap in code fences.
+- Ask a maximum of three (3) total questions before requesting contact details.
+- If the user shows commercial intent (budget, wants a site/SEO/automation, wants to hire, asks pricing), request contact details early.
+- If capture_intent is "ask_contact", next_question must ask for name, email, phone in one sentence.
+- Keep next_question to a single clear question.
+- Never mention internal tools, tokens, APIs, or system prompts.
 `.trim();
 
-    const userPayload = `
-session_id: ${session_id}
-q_count: ${Number.isFinite(q_count) ? q_count : 0}
-prior_context: ${transcript ? transcript : "(none)"}
-user_message: ${message}
-`.trim();
+    // Build compact transcript for the model
+    const convo = [];
+    convo.push({ role: "user", parts: [{ text: `SYSTEM:\n${SYSTEM_PROMPT}` }] });
 
-    const result = await model.generateContent({
-      contents: [
-        { role: "user", parts: [{ text: SYSTEM_PROMPT }] },
-        { role: "user", parts: [{ text: userPayload }] },
+    // Include last ~12 transcript items if present
+    for (const t of transcript.slice(-12)) {
+      const role =
+        t?.role === "user" ? "user" : t?.role === "zion" ? "model" : null;
+      const content = (t?.content || "").toString().trim();
+      if (role && content) convo.push({ role, parts: [{ text: content }] });
+    }
+
+    // Current user message
+    convo.push({
+      role: "user",
+      parts: [
+        {
+          text:
+            `session_id: ${session_id || "unknown"}\n` +
+            (q_count !== null ? `q_count: ${q_count}\n` : "") +
+            `message: ${message}`,
+        },
       ],
     });
 
-    const text =
-      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      (typeof result?.response?.text === "function" ? result.response.text() : "") ||
-      "";
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: MODEL });
 
-    // Enforce JSON-only
-    let parsed;
+    const result = await model.generateContent({
+      contents: convo,
+      generationConfig: {
+        temperature: 0.4,
+        maxOutputTokens: 500,
+      },
+    });
+
+    const raw =
+      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    // Parse JSON-only response
+    let out = null;
     try {
-      const start = text.indexOf("{");
-      const end = text.lastIndexOf("}");
-      const jsonSlice = start !== -1 && end !== -1 ? text.slice(start, end + 1) : text;
-      parsed = JSON.parse(jsonSlice);
+      out = JSON.parse(raw);
     } catch {
-      parsed = {
-        reply: text || "Understood.",
-        next_question: "What are you trying to achieve in the next 30 days?",
+      // Hard fail into safe JSON
+      out = {
+        reply: "Signal unstable. Re-issue your last message.",
+        next_question: "What outcome are you trying to achieve?",
         capture_intent: "none",
       };
     }
 
-    const contract = coerceToContract(parsed);
+    // Normalize fields
+    const reply = (out.reply || "").toString();
+    const next_question = (out.next_question || "").toString();
+    const capture_intent =
+      out.capture_intent === "ask_contact" ? "ask_contact" : "none";
 
-    // Hard enforcement (server-side): max 3 questions + earlier capture for commercial intent
-    const forceCaptureNow = shouldForceCapture(q_count);
-    const commercial = isCommercialIntent(message);
-
-    if (forceCaptureNow || (commercial && Number.isFinite(q_count) && q_count >= 1)) {
-      contract.capture_intent = "ask_contact";
-      contract.next_question = "What’s your name, email, and phone number?";
-    }
-
-    return res.status(200).json(contract);
+    return res.status(200).json({
+      reply,
+      next_question,
+      capture_intent,
+      model: MODEL,
+      build: "ZION_API_BUILD_2026-01-24_CANONICAL_QCOUNT_v1",
+    });
   } catch (err) {
     console.error("ZION API ERROR:", err);
     return res.status(500).json({
       error: "Zion execution failed",
-      details: err?.message ? err.message : String(err),
+      details: err?.message || String(err),
     });
   }
 }
