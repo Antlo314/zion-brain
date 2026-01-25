@@ -10,7 +10,7 @@
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const BUILD = "ZION_API_BUILD_2026-01-25_JSON_MODE_SCHEMA_v1";
+const BUILD = "ZION_API_BUILD_2026-01-25_JSON_MODE_SCHEMA_v2_COMPAT";
 const COMMIT =
   process.env.VERCEL_GIT_COMMIT_SHA ||
   process.env.VERCEL_GITHUB_COMMIT_SHA ||
@@ -42,7 +42,7 @@ You must output exactly this schema:
 }
 `.trim();
 
-// JSON Schema used for controlled output (Structured Output / JSON Mode)
+// Compatible JSON schema for responseSchema (no additionalProperties)
 const RESPONSE_SCHEMA = {
   type: "object",
   properties: {
@@ -51,7 +51,6 @@ const RESPONSE_SCHEMA = {
     capture_intent: { type: "string", enum: ["none", "ask_contact"] },
   },
   required: ["reply", "next_question", "capture_intent"],
-  additionalProperties: false,
 };
 
 function setCors(res) {
@@ -117,8 +116,6 @@ async function runZion(userMessage) {
 
   const genAI = new GoogleGenerativeAI(API_KEY);
 
-  // Force JSON output using generationConfig + schema
-  // Docs: responseMimeType application/json + responseSchema (structured outputs)
   const model = genAI.getGenerativeModel({
     model: MODEL,
     systemInstruction: SYSTEM_PROMPT,
@@ -135,13 +132,10 @@ async function runZion(userMessage) {
   const result = await model.generateContent(prompt);
   const text = result?.response?.text?.() ?? "";
 
-  // Because we requested JSON mode, this should be valid JSON.
-  // Still keep a safe parse.
   try {
     const parsed = JSON.parse(text);
     return coerceToContract(parsed);
   } catch {
-    // If something unexpected happens, fail gracefully but clearly
     return {
       reply:
         "I received your message, but the model output was not valid JSON. Re-issue your last message.",
@@ -154,7 +148,6 @@ async function runZion(userMessage) {
 export default async function handler(req, res) {
   setCors(res);
 
-  // Proof headers
   res.setHeader("X-Zion-Build", BUILD);
   res.setHeader("X-Zion-Commit", COMMIT);
 
@@ -175,7 +168,6 @@ export default async function handler(req, res) {
 
   const body = await readJsonBody(req);
 
-  // Body ingestion debug headers (keep during stabilization)
   res.setHeader("X-Zion-HasBody", body ? "1" : "0");
   res.setHeader("X-Zion-HasMessage", body?.message ? "1" : "0");
 
