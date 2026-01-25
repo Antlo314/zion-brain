@@ -1,11 +1,12 @@
 // /api/intake.js
-// Vercel Serverless Function (Node, ESM)
-// Flow:
-// 1) Receive intake payload from landing page
-// 2) Generate proposal JSON via Gemini (Zion brain rules in ZION_SYSTEM_PROMPT)
-// 3) Save proposal to Vercel KV as proposal:<pid> with TTL
-// 4) POST lead data to GHL inbound webhook (optional but recommended)
-// 5) Return { ok:true, pid, redirect_url } so frontend can navigate to /summary?pid=...
+// Intake -> GHL webhook -> Gemini proposal (strict JSON) -> KV store -> return pid + redirect
+//
+// Required env:
+//   GEMINI_API_KEY
+//   GEMINI_MODEL (e.g. gemini-3-pro-preview)
+//   GHL_WEBHOOK_URL
+//   KV_REST_API_URL
+//   KV_REST_API_TOKEN
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
@@ -18,255 +19,297 @@ function bad(res, status, msg, extra = {}) {
   return json(res, status, { ok: false, error: msg, ...extra });
 }
 
-function safeTrim(v) {
-  return typeof v === "string" ? v.trim() : "";
-}
-
-function splitFullName(fullName) {
-  const s = safeTrim(fullName).replace(/\s+/g, " ");
-  if (!s) return { first_name: "", last_name: "" };
-  const parts = s.split(" ");
-  if (parts.length === 1) return { first_name: parts[0], last_name: "" };
-  return { first_name: parts[0], last_name: parts.slice(1).join(" ") };
-}
-
-function makePid() {
-  // short, URL-safe id
-  return Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+async function readJson(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return null; }
 }
 
 async function kvPipeline(cmds) {
   const url = process.env.KV_REST_API_URL;
   const token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) throw new Error("KV env not set (KV_REST_API_URL / KV_REST_API_TOKEN)");
+  if (!url || !token) throw new Error("KV env not set");
   const endpoint = url.replace(/\/$/, "") + "/pipeline";
-
   const r = await fetch(endpoint, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(cmds),
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(cmds)
   });
-
   const data = await r.json().catch(() => null);
-  if (!r.ok) {
-    const err = data ? JSON.stringify(data) : `HTTP ${r.status}`;
-    throw new Error(`KV pipeline failed: ${err}`);
-  }
+  if (!r.ok) throw new Error(`KV pipeline failed: ${data ? JSON.stringify(data) : `HTTP ${r.status}`}`);
   return data;
 }
 
-async function kvSetJsonWithTTL(key, obj, ttlSeconds) {
+async function kvSetJson(key, obj, ttlSeconds = 1800) {
   const val = JSON.stringify(obj);
-  // Use SETEX so we get predictable TTL behavior.
-  // Upstash REST supports Redis commands; Vercel KV REST pipeline passes them through.
-  await kvPipeline([{ command: ["SETEX", key, String(ttlSeconds), val] }]);
+  await kvPipeline([
+    { command: ["SET", key, val] },
+    { command: ["EXPIRE", key, String(ttlSeconds)] }
+  ]);
 }
 
-async function callGeminiProposal({ modelName, apiKey, systemPrompt, payload }) {
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: modelName });
+function makePid() {
+  // short-ish pid, good enough
+  return Math.random().toString(16).slice(2, 10).toUpperCase();
+}
 
-  // Hard rule: JSON only (no markdown). The summary page expects structured fields.
-  const instruction = `
-Return ONLY valid JSON. No markdown. No code fences.
+// --- JSON hardening helpers ---
+function extractFirstJsonObject(text) {
+  if (!text) return null;
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  const candidate = text.slice(start, end + 1);
+  try { return JSON.parse(candidate); } catch { return null; }
+}
 
-You must output an object shaped like:
+function validateProposalShape(obj) {
+  // Minimal validation so bad shapes don’t silently pass.
+  if (!obj || typeof obj !== "object") return false;
+  if (!obj.executive_summary || typeof obj.executive_summary !== "string") return false;
+  if (!Array.isArray(obj.tiers) || obj.tiers.length !== 3) return false;
+  for (const t of obj.tiers) {
+    if (!t || typeof t !== "object") return false;
+    if (!t.name || typeof t.name !== "string") return false;
+    if (typeof t.price_monthly !== "number") return false;
+    if (!Array.isArray(t.scope)) return false;
+  }
+  return true;
+}
+
+function proposalSchemaText() {
+  // Keep it as plain text schema; Gemini follows this well when reinforced.
+  return `
+Return ONLY a valid JSON object matching this schema. No markdown. No commentary.
+
 {
-  "executive_summary": "string",
+  "executive_summary": "string (5-10 sentences, executive tone)",
+  "pricing_logic": {
+    "temperature": "Cold|Warm|Hot",
+    "recommended_plan": "Ignite|Elevate|Luminary|None",
+    "reasoning": ["string", "..."]
+  },
   "tiers": [
-    { "name": "Ignite", "monthly": 950, "activation_fee": 500, "includes": ["..."], "ideal_for": "..." },
-    { "name": "Elevate", "monthly": 1450, "activation_fee": 500, "includes": ["..."], "ideal_for": "..." },
-    { "name": "Luminary", "monthly": 2250, "activation_fee": 500, "includes": ["..."], "ideal_for": "..." }
-  ],
-  "one_off_services": [
-    { "name": "Voice Agent", "range": "$49–$150/mo + setup", "notes": "..." },
-    { "name": "Smart Site", "range": "$1k–$4k", "notes": "..." },
-    { "name": "Content Automation", "range": "$350–$2k/mo", "notes": "..." },
-    { "name": "Local SEO & Automations", "range": "$500–$1,200/mo (+ build $750–$4k)", "notes": "..." }
-  ],
-  "pricing_reasoning": "string",
-  "next_steps": ["...","..."]
-}
-`;
-
-  const prompt = [
-    { role: "user", parts: [{ text: `${systemPrompt || ""}\n\n${instruction}\n\nINTAKE_PAYLOAD:\n${JSON.stringify(payload, null, 2)}` }] },
-  ];
-
-  const result = await model.generateContent({
-    contents: prompt,
-    generationConfig: {
-      temperature: 0.4,
-      maxOutputTokens: 1200,
+    {
+      "name": "Ignite",
+      "price_monthly": 950,
+      "activation_fee": 500,
+      "why_fit": "string",
+      "scope": ["string", "..."],
+      "timeline": "string"
     },
+    {
+      "name": "Elevate",
+      "price_monthly": 1450,
+      "activation_fee": 500,
+      "why_fit": "string",
+      "scope": ["string", "..."],
+      "timeline": "string"
+    },
+    {
+      "name": "Luminary",
+      "price_monthly": 2250,
+      "activation_fee": 500,
+      "why_fit": "string",
+      "scope": ["string", "..."],
+      "timeline": "string"
+    }
+  ],
+  "one_offs": [
+    { "name": "Voice Agent", "from_monthly": 150, "setup_from": 497, "notes": "string" },
+    { "name": "Content Automation", "from_monthly": 350, "setup_from": 500, "notes": "string" },
+    { "name": "Smart Site", "from_monthly": 0, "setup_from": 1000, "notes": "string" },
+    { "name": "Local SEO", "from_monthly": 500, "setup_from": 750, "notes": "string" }
+  ],
+  "next_steps": ["string", "..."]
+}
+`.trim();
+}
+
+function buildProposalPrompt(payload) {
+  const {
+    full_name, email, phone, business_name, website,
+    industry, primary_goal, budget_range, timeline, bottleneck,
+    intent, page_url, conversation_summary
+  } = payload;
+
+  return `
+You are Zion, executive intelligence for Lumen Labs (AI growth systems studio).
+Your task: generate a pricing-aware executive summary and 3-tier proposal for the lead.
+
+Hard rules:
+- Output must be JSON only. No markdown. No code fences. No extra keys.
+- Use Lumen Labs locked pricing:
+  Ignite $950/mo, Elevate $1,450/mo, Luminary $2,250/mo
+  Activation Fee: $500 (one-time)
+- Always return exactly 3 tiers (Ignite/Elevate/Luminary) and include one_offs options.
+- Write like an executive operator: concise, specific, no hype.
+
+Lead intake:
+full_name: ${full_name || ""}
+email: ${email || ""}
+phone: ${phone || ""}
+business_name: ${business_name || ""}
+website: ${website || ""}
+industry: ${industry || ""}
+primary_goal: ${primary_goal || ""}
+budget_range: ${budget_range || ""}
+timeline: ${timeline || ""}
+bottleneck: ${bottleneck || ""}
+intent: ${intent || ""}
+page_url: ${page_url || ""}
+conversation_summary: ${conversation_summary || ""}
+
+${proposalSchemaText()}
+`.trim();
+}
+
+async function generateProposalStrict(payload) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const modelName = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
+  if (!apiKey) throw new Error("GEMINI_API_KEY missing");
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    // If this SDK/version supports it, it helps; if ignored, no harm.
+    generationConfig: {
+      temperature: 0.2,
+      topP: 0.9,
+      maxOutputTokens: 1400,
+      // Some Gemini endpoints honor this (forces JSON). If not honored, our parser still handles it.
+      responseMimeType: "application/json"
+    }
   });
 
-  const text = result?.response?.text?.() || "";
-  const raw = text.trim();
+  // Attempt 1
+  const prompt = buildProposalPrompt(payload);
+  const r1 = await model.generateContent(prompt);
+  const t1 = (r1?.response?.text?.() || "").trim();
 
-  // Defensive parse
-  let parsed = null;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // Try to recover if model accidentally wrapped with extra text
-    const first = raw.indexOf("{");
-    const last = raw.lastIndexOf("}");
-    if (first !== -1 && last !== -1 && last > first) {
-      try {
-        parsed = JSON.parse(raw.slice(first, last + 1));
-      } catch {}
-    }
-  }
+  // Try strict parse
+  let obj = null;
+  try { obj = JSON.parse(t1); } catch { obj = extractFirstJsonObject(t1); }
+  if (obj && validateProposalShape(obj)) return { obj, raw: t1 };
 
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error("Gemini returned non-JSON proposal");
-  }
+  // Attempt 2 (repair): feed the bad output back and demand corrected JSON only
+  const repairPrompt = `
+You produced invalid JSON.
 
-  return { parsed, raw };
+Return ONLY valid JSON matching the schema exactly. No markdown. No commentary.
+Here is your previous output:
+${t1}
+
+${proposalSchemaText()}
+`.trim();
+
+  const r2 = await model.generateContent(repairPrompt);
+  const t2 = (r2?.response?.text?.() || "").trim();
+
+  try { obj = JSON.parse(t2); } catch { obj = extractFirstJsonObject(t2); }
+  if (obj && validateProposalShape(obj)) return { obj, raw: t2 };
+
+  // Give caller both raw outputs for debugging
+  const err = new Error("Gemini returned non-JSON proposal");
+  err.raw1 = t1;
+  err.raw2 = t2;
+  throw err;
 }
 
-async function postToGHL(webhookUrl, leadPayload) {
-  if (!webhookUrl) return { skipped: true };
-  const r = await fetch(webhookUrl, {
+async function sendToGHL(payload) {
+  const url = process.env.GHL_WEBHOOK_URL;
+  if (!url) throw new Error("GHL_WEBHOOK_URL missing");
+
+  // Your workflow mapping expects first_name/last_name/email/phone + extras (as seen in your mapping reference).
+  const full = (payload.full_name || "").trim();
+  const parts = full.split(/\s+/).filter(Boolean);
+  const first_name = parts[0] || "";
+  const last_name = parts.slice(1).join(" ") || "";
+
+  const ghlPayload = {
+    first_name,
+    last_name,
+    email: (payload.email || "").trim(),
+    phone: (payload.phone || "").trim(),
+    intent: payload.intent || "Zion Activation",
+    conversation_summary: payload.conversation_summary || "",
+    source: "Zion On-Page Intelligence",
+    page_url: payload.page_url || ""
+  };
+
+  const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(leadPayload),
+    body: JSON.stringify(ghlPayload)
   });
-  const text = await r.text().catch(() => "");
-  return { ok: r.ok, status: r.status, body: text.slice(0, 2000) };
+
+  // Even if workflow runs async, we just need a successful POST.
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`GHL webhook failed: HTTP ${r.status} ${txt}`.trim());
+  }
+  return { ok: true };
 }
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return json(res, 200, { ok: true });
 
+  if (req.method === "OPTIONS") return json(res, 200, { ok: true });
   if (req.method !== "POST") return bad(res, 405, "Use POST");
 
+  const body = await readJson(req);
+  if (!body) return bad(res, 400, "Invalid JSON body");
+
+  const email = (body.email || "").trim();
+  if (!email) return bad(res, 400, "Missing email");
+
+  const pid = makePid();
+
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    const modelName = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
-    const systemPrompt = process.env.ZION_SYSTEM_PROMPT || "";
-    const ghlWebhookUrl = process.env.GHL_WEBHOOK_URL || "";
+    // 1) Create/update contact in GHL immediately
+    await sendToGHL(body);
 
-    if (!apiKey) return bad(res, 500, "Missing GEMINI_API_KEY");
-    // KV env checked inside kvPipeline
+    // 2) Generate proposal JSON (strict)
+    const { obj: proposal, raw } = await generateProposalStrict(body);
 
-    // Vercel parses JSON body automatically in many cases,
-    // but we also handle raw string body safely.
-    let body = req.body;
-    if (typeof body === "string") {
-      try { body = JSON.parse(body); } catch { body = {}; }
-    }
-    body = body && typeof body === "object" ? body : {};
-
-    // Normalize fields coming from your intake modal
-    const full_name = safeTrim(body.full_name || body.name || body.fullName || "");
-    const email = safeTrim(body.email || "");
-    const phone = safeTrim(body.phone || "");
-    const business_name = safeTrim(body.business_name || body.businessName || "");
-    const website = safeTrim(body.website || "");
-    const industry = safeTrim(body.industry || "");
-    const primary_goal = safeTrim(body.primary_goal || body.primaryGoal || "");
-    const budget_range = safeTrim(body.budget_range || body.budgetRange || "");
-    const timeline = safeTrim(body.timeline || "");
-    const bottleneck = safeTrim(body.bottleneck || body.primary_bottleneck || "");
-    const intent = safeTrim(body.intent || "Zion Activation");
-    const page_url = safeTrim(body.page_url || body.pageUrl || "");
-    const conversation_summary = safeTrim(body.conversation_summary || body.conversationSummary || "");
-    const session_id = safeTrim(body.session_id || body.sessionId || "");
-
-    if (!email) return bad(res, 400, "Missing email (required)");
-
-    const { first_name, last_name } = splitFullName(full_name);
-
-    const pid = makePid();
-    const created_at = new Date().toISOString();
-
-    const intakeRecord = {
+    // 3) Store record in KV (30 min TTL typical; adjust as needed)
+    const record = {
       pid,
-      created_at,
-      full_name,
-      first_name,
-      last_name,
-      email,
-      phone,
-      business_name,
-      website,
-      industry,
-      primary_goal,
-      budget_range,
-      timeline,
-      bottleneck,
-      intent,
-      page_url,
-      conversation_summary,
-      session_id,
-      source: "Zion On-Page Intelligence",
+      created_at: new Date().toISOString(),
+      intake: body,
+      proposal
     };
+    await kvSetJson(`proposal:${pid}`, record, 1800);
 
-    // 1) Generate proposal via Gemini
-    const { parsed: proposal, raw: proposal_raw } = await callGeminiProposal({
-      modelName,
-      apiKey,
-      systemPrompt,
-      payload: intakeRecord,
-    });
-
-    // 2) Save to KV (TTL)
-    // Recommended: 7 days. You can change this later.
-    const TTL_SECONDS = 60 * 60 * 24 * 7;
-
-    const kvRecord = {
-      pid,
-      created_at,
-      model: modelName,
-      intake: intakeRecord,
-      proposal,
-      // keep raw for debugging (optional)
-      proposal_raw,
-    };
-
-    await kvSetJsonWithTTL(`proposal:${pid}`, kvRecord, TTL_SECONDS);
-
-    // 3) Send lead to GHL (so your workflow can create/update contact + opportunity)
-    const ghlPayload = {
-      first_name,
-      last_name,
-      email,
-      phone,
-      intent,
-      conversation_summary: conversation_summary || proposal?.pricing_reasoning || "",
-      source: "Zion On-Page Intelligence",
-      page_url,
-      proposal_id: pid,
-
-      // include full intake details for mapping or notes
-      business_name,
-      website,
-      industry,
-      primary_goal,
-      budget_range,
-      timeline,
-      bottleneck,
-      session_id,
-    };
-
-    const ghlResult = await postToGHL(ghlWebhookUrl, ghlPayload);
-
-    // 4) Respond with pid + redirect target
     return json(res, 200, {
       ok: true,
       pid,
       redirect_url: `/summary?pid=${encodeURIComponent(pid)}`,
-      ghl: ghlResult,
+      // helpful in development; safe to remove later
+      debug: { stored: true }
     });
   } catch (e) {
+    // Optional: store failure debug to KV so you can inspect what Gemini returned
+    try {
+      await kvSetJson(
+        `proposal_fail:${pid}`,
+        {
+          pid,
+          created_at: new Date().toISOString(),
+          intake: body,
+          error: e?.message || String(e),
+          raw1: e?.raw1 || null,
+          raw2: e?.raw2 || null
+        },
+        1800
+      );
+    } catch {}
+
     return bad(res, 500, e?.message || "Server error");
   }
 }
+
