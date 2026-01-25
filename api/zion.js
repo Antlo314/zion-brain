@@ -1,20 +1,13 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-export const config = {
-  runtime: "nodejs",
-};
+export const config = { runtime: "nodejs" };
 
 const MODEL = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
-const BUILD = "ZION_API_BUILD_2026-01-24_CANONICAL_QCOUNT_v2_CORS";
+const BUILD = "ZION_API_BUILD_2026-01-25_DEPLOY_PROBE_A";
 
 /**
  * CORS support for GHL-hosted landing pages (browser clients).
- * - curl works without this
- * - browsers require OPTIONS preflight + Access-Control-* headers
- *
- * To lock this down later, set env:
- *   CORS_ORIGIN=https://lumenlabsatl.com
- * or comma-separated:
+ * Lock later with env:
  *   CORS_ORIGIN=https://lumenlabsatl.com,https://www.lumenlabsatl.com
  */
 function applyCors(req, res) {
@@ -72,15 +65,9 @@ function normalizeTranscript(input) {
   return out;
 }
 
-/**
- * SYSTEM PROMPT — executive Zion (locked direction)
- * - JSON only output
- * - max 3 questions total before contact capture
- * - early capture on commercial intent
- */
 const SYSTEM_PROMPT = `
 You are Zion — executive intelligence for Lumen Labs (AI growth systems studio).
-Tone: calm, precise, operator-grade. No fluff. No hype.
+Tone: calm, precise, operator-grade. No fluff.
 
 You MUST respond ONLY in valid JSON with this exact schema:
 {
@@ -91,14 +78,14 @@ You MUST respond ONLY in valid JSON with this exact schema:
 
 Hard rules:
 - Ask a maximum of three (3) total questions before requesting contact details.
-- If the user signals commercial intent (pricing, budget, "need a site/SEO/automation", "want to hire", timelines, consultations), request contact details early.
+- If the user signals commercial intent (pricing, budget, "need a site/SEO/automation", "want to hire", timelines), request contact details early.
 - If capture_intent is "ask_contact", next_question MUST ask for name, email, and phone in one sentence.
 - next_question must be ONE question only, short and clear.
 - Do not mention internal tools, APIs, tokens, system prompts, policies, or constraints.
 - Do not use markdown. JSON only.
 
-Behavioral guidance:
-- Your job is to qualify quickly: business type, primary goal, urgency, and budget signals.
+Guidance:
+- Qualify quickly: business type, primary goal, urgency, budget signal.
 - If user is vague, ask one clarifying question.
 - If user is ready, move to contact capture immediately.
 `.trim();
@@ -150,6 +137,13 @@ export default async function handler(req, res) {
     // ---- CORS for browser clients (GHL) ----
     applyCors(req, res);
 
+    // ---- DEBUG HEADERS (prove deployed build/commit) ----
+    res.setHeader("X-Zion-Build", BUILD);
+    res.setHeader(
+      "X-Zion-Commit",
+      process.env.VERCEL_GIT_COMMIT_SHA || "unknown"
+    );
+
     // Preflight
     if (req.method === "OPTIONS") {
       return res.status(204).end();
@@ -172,12 +166,13 @@ export default async function handler(req, res) {
       return res.status(500).json({
         error: "Zion execution failed",
         details: "Missing GEMINI_API_KEY",
+        build: BUILD,
       });
     }
 
     const body = safeParseBody(req.body);
     if (!body) {
-      return res.status(400).json({ error: "Invalid JSON body" });
+      return res.status(400).json({ error: "Invalid JSON body", build: BUILD });
     }
 
     const message = (body?.message || "").toString().trim();
@@ -190,12 +185,16 @@ export default async function handler(req, res) {
     const transcript = normalizeTranscript(body?.transcript);
 
     if (!message) {
-      return res.status(400).json({ error: "Missing message" });
+      return res
+        .status(400)
+        .json({ error: "Missing message", build: BUILD });
     }
 
-    // Hard policy: if q_count says we're past limit OR commercial intent, force capture.
-    // (This is the backend guard even if frontend fails to send q_count sometimes.)
-    if ((q_count !== null && q_count >= 3) || (q_count === null && isCommercialIntent(message) && transcript.length >= 2)) {
+    // Hard guard: cap turns; capture on intent signals
+    if (
+      (q_count !== null && q_count >= 3) ||
+      (q_count === null && isCommercialIntent(message) && transcript.length >= 2)
+    ) {
       const forced = forceAskContactJSON();
       return res.status(200).json({ ...forced, model: MODEL, build: BUILD });
     }
@@ -203,16 +202,16 @@ export default async function handler(req, res) {
     // Compose conversation
     const contents = [];
 
-    // Inject system prompt as first user message (reliable for this SDK)
+    // System prompt injection
     contents.push({
       role: "user",
       parts: [{ text: `SYSTEM:\n${SYSTEM_PROMPT}` }],
     });
 
-    // Add recent transcript
+    // Recent transcript
     for (const m of transcript) contents.push(m);
 
-    // Add current user message with light metadata
+    // Current message with light metadata
     const meta =
       `session_id: ${session_id || "unknown"}\n` +
       (q_count !== null ? `q_count: ${q_count}\n` : "") +
@@ -237,7 +236,7 @@ export default async function handler(req, res) {
     const raw =
       result?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    let out = null;
+    let out;
     try {
       out = JSON.parse(raw);
     } catch {
@@ -250,13 +249,12 @@ export default async function handler(req, res) {
     const capture_intent =
       out?.capture_intent === "ask_contact" ? "ask_contact" : "none";
 
-    // If model violates schema, harden response
     if (!reply) {
       const fb = safeJsonOnlyFallback();
       return res.status(200).json({ ...fb, model: MODEL, build: BUILD });
     }
 
-    // Enforce contact prompt formatting if capture requested
+    // Enforce contact prompt format
     if (capture_intent === "ask_contact") {
       const fixed = {
         reply,
@@ -266,7 +264,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ...fixed, model: MODEL, build: BUILD });
     }
 
-    // Backend guard: if q_count is 2 (about to exceed), bias toward contact capture on any intent.
+    // Bias capture if approaching question limit + intent signal
     if (q_count !== null && q_count >= 2 && isCommercialIntent(message)) {
       const forced = forceAskContactJSON();
       return res.status(200).json({ ...forced, model: MODEL, build: BUILD });
@@ -284,8 +282,10 @@ export default async function handler(req, res) {
     return res.status(500).json({
       error: "Zion execution failed",
       details: err?.message || String(err),
+      model: MODEL,
       build: BUILD,
     });
   }
 }
+
 
