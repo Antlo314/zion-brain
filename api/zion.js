@@ -8,16 +8,17 @@
  *   "capture_intent": "none" | "ask_contact"
  * }
  *
- * Key features:
- * - Robust body parsing (works in plain Vercel serverless, no framework assumptions)
- * - Gemini JSON mode + response schema (eliminates non-JSON output)
- * - Deterministic build/commit headers for deployment proof
+ * v4 patches:
+ * - JSON mode + schema retained
+ * - Resilient JSON parsing (slice between braces)
+ * - One retry on parse failure (temperature 0 + stricter instruction)
+ * - Debug headers: X-Zion-Parse, X-Zion-RawLen
  * - Server-side capture gating (forces early capture on business intent)
  */
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const BUILD = "ZION_API_BUILD_2026-01-25_JSON_MODE_SCHEMA_v3_CAPTURE_GATE";
+const BUILD = "ZION_API_BUILD_2026-01-25_JSON_MODE_SCHEMA_v4_PARSE_RETRY";
 const COMMIT =
   process.env.VERCEL_GIT_COMMIT_SHA ||
   process.env.VERCEL_GITHUB_COMMIT_SHA ||
@@ -38,7 +39,7 @@ Tone:
 
 Hard rules:
 1) Ask a maximum of THREE questions total before requesting contact details.
-2) Collect contact details EARLY when intent is real. If the user is expressing business intent (growth, leads, website, automation, systems, pricing, launching), trigger capture_intent="ask_contact" by question 1–2.
+2) Collect contact details EARLY when intent is real. If the user expresses business intent (growth, leads, website, automation, systems, pricing, launching), trigger capture_intent="ask_contact" by question 1–2.
 3) Keep questions short and high-signal.
 4) Output MUST be valid JSON only. No markdown, no code fences.
 
@@ -69,12 +70,10 @@ function setCors(res) {
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-// -------- Robust Body Reader (single source of truth) --------
+// -------- Robust Body Reader --------
 async function readJsonBody(req) {
-  // If runtime already parsed it
   if (req.body && typeof req.body === "object") return req.body;
 
-  // If runtime passed a string
   if (req.body && typeof req.body === "string") {
     try {
       return JSON.parse(req.body);
@@ -83,7 +82,6 @@ async function readJsonBody(req) {
     }
   }
 
-  // Otherwise read the raw stream
   const raw = await new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (chunk) => (data += chunk));
@@ -123,8 +121,6 @@ function coerceToContract(obj) {
 // ---------------- Intent Gate (forces early capture) ----------------
 function shouldAskContact(message) {
   const m = (message || "").toLowerCase();
-
-  // High-signal business intent keywords
   const hits = [
     "website",
     "site",
@@ -149,21 +145,34 @@ function shouldAskContact(message) {
     "systems",
     "growth",
   ];
-
   return hits.some((k) => m.includes(k));
 }
 
-// ---------------- Gemini call (JSON mode + schema) ----------------
-async function runZion(userMessage) {
-  if (!API_KEY) {
-    return {
-      reply: "Zion is live, but GEMINI_API_KEY is missing in Vercel env.",
-      next_question: "Do you want to run in diagnostic mode?",
-      capture_intent: "none",
-    };
+// ---------------- JSON parse helpers ----------------
+function tryParseJson(text) {
+  if (!text || typeof text !== "string") return { ok: false, parsed: null, mode: "empty" };
+
+  // 1) direct parse
+  try {
+    return { ok: true, parsed: JSON.parse(text), mode: "ok" };
+  } catch {}
+
+  // 2) slice between braces
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first !== -1 && last !== -1 && last > first) {
+    const slice = text.slice(first, last + 1);
+    try {
+      return { ok: true, parsed: JSON.parse(slice), mode: "sliced" };
+    } catch {}
   }
 
-  const genAI = new GoogleGenerativeAI(API_KEY);
+  return { ok: false, parsed: null, mode: "fail" };
+}
+
+// ---------------- Gemini call (JSON mode + schema) ----------------
+async function generateZion(genAI, userMessage, opts = {}) {
+  const temperature = typeof opts.temperature === "number" ? opts.temperature : 0.4;
 
   const model = genAI.getGenerativeModel({
     model: MODEL,
@@ -171,42 +180,75 @@ async function runZion(userMessage) {
     generationConfig: {
       responseMimeType: "application/json",
       responseSchema: RESPONSE_SCHEMA,
-      temperature: 0.4,
+      temperature,
       maxOutputTokens: 500,
     },
   });
 
-  const prompt = `User message:\n${userMessage}`;
+  // Extra instruction (helps in edge cases even with JSON mode)
+  const prompt = [
+    "Return ONLY valid JSON that matches the required schema.",
+    "Do not include any extra keys, comments, markdown, or surrounding text.",
+    "",
+    `User message:\n${userMessage}`,
+  ].join("\n");
 
   const result = await model.generateContent(prompt);
   const text = result?.response?.text?.() ?? "";
+  return text;
+}
 
-  try {
-    const parsed = JSON.parse(text);
-    return coerceToContract(parsed);
-  } catch {
-    // This should be rare once JSON mode is active
+async function runZionWithRetry(userMessage) {
+  if (!API_KEY) {
     return {
+      out: {
+        reply: "Zion is live, but GEMINI_API_KEY is missing in Vercel env.",
+        next_question: "Do you want to run in diagnostic mode?",
+        capture_intent: "none",
+      },
+      parse: "ok",
+      rawLen: 0,
+    };
+  }
+
+  const genAI = new GoogleGenerativeAI(API_KEY);
+
+  // Attempt 1
+  const t1 = await generateZion(genAI, userMessage, { temperature: 0.4 });
+  const p1 = tryParseJson(t1);
+  if (p1.ok) {
+    return { out: coerceToContract(p1.parsed), parse: p1.mode, rawLen: t1.length };
+  }
+
+  // Attempt 2 (retry): stricter / more deterministic
+  const t2 = await generateZion(genAI, userMessage, { temperature: 0.0 });
+  const p2 = tryParseJson(t2);
+  if (p2.ok) {
+    const mode = p2.mode === "ok" ? "retry_ok" : "retry_sliced";
+    return { out: coerceToContract(p2.parsed), parse: mode, rawLen: t2.length };
+  }
+
+  return {
+    out: {
       reply:
         "I received your message, but the model output was not valid JSON. Re-issue your last message.",
       next_question: "What outcome are you trying to achieve?",
       capture_intent: "none",
-    };
-  }
+    },
+    parse: "fail",
+    rawLen: Math.max(t1?.length || 0, t2?.length || 0),
+  };
 }
 
 // ---------------- Vercel Serverless Handler ----------------
 export default async function handler(req, res) {
   setCors(res);
 
-  // Proof headers (keep these permanently)
   res.setHeader("X-Zion-Build", BUILD);
   res.setHeader("X-Zion-Commit", COMMIT);
 
-  // Preflight
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // Health
   if (req.method === "GET") {
     return json(res, 200, {
       status: "ok",
@@ -220,10 +262,8 @@ export default async function handler(req, res) {
     return json(res, 405, { error: "Method Not Allowed", build: BUILD });
   }
 
-  // Parse body
   const body = await readJsonBody(req);
 
-  // Body ingestion debug (keep during stabilization; remove later if desired)
   res.setHeader("X-Zion-HasBody", body ? "1" : "0");
   res.setHeader("X-Zion-HasMessage", body?.message ? "1" : "0");
 
@@ -232,16 +272,17 @@ export default async function handler(req, res) {
   const message = typeof body.message === "string" ? body.message.trim() : "";
   if (!message) return json(res, 400, { error: "Missing message", build: BUILD });
 
-  // Force early capture when intent is present
   const forceCapture = shouldAskContact(message);
 
   try {
-    const out = await runZion(message);
+    const { out, parse, rawLen } = await runZionWithRetry(message);
+
+    // Debug headers (no content leakage)
+    res.setHeader("X-Zion-Parse", parse);
+    res.setHeader("X-Zion-RawLen", String(rawLen));
 
     // Server-side override for consistency
-    if (forceCapture) {
-      out.capture_intent = "ask_contact";
-    }
+    if (forceCapture) out.capture_intent = "ask_contact";
 
     return json(res, 200, { ...out, model: MODEL, build: BUILD });
   } catch (err) {
