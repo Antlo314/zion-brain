@@ -1,265 +1,257 @@
 /**
- * /api/zion.js  (Vercel Serverless Function)
- *
- * Zion v5 — deterministic QA gate + Gemini 3 Pro preview
+ * Zion API — V5 (Fast Capture / No Loop)
  * Contract:
- *   Request: { message, session_id, turn, notes }
- *   Response: {
- *     reply, next_question, capture_intent, turn, notes,
- *     model, build
- *   }
- *
- * Notes are an OBJECT (not an array), persisted client-side in localStorage and round-tripped.
+ *  POST { message, session_id, turn, notes }
+ *  -> { reply, next_question, capture_intent, turn, notes, model, build }
  */
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const BUILD = "ZION_API_BUILD_2026-01-25_v5_DETERMINISTIC_QA_GATE";
+const BUILD = "ZION_API_BUILD_2026-01-25_v5_FAST_CAPTURE_NO_LOOP_v2";
 const MODEL = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
-const API_KEY = process.env.GEMINI_API_KEY;
 
-// CORS: allow all origins for now (tighten later if needed)
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+// ---- CORS allowlist ----
+const ALLOW_ORIGINS = [
+  "https://lumenlabsatl.com",
+  "https://www.lumenlabsatl.com",
+  "https://app.lumenlabsatl.com",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000"
+];
+
+function setCors(res, origin) {
+  const o = origin || "";
+  const allow = ALLOW_ORIGINS.includes(o) ? o : "*";
+  res.setHeader("Access-Control-Allow-Origin", allow);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-// Safe JSON helper
-function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return null; }
+function isoNow() { return new Date().toISOString(); }
+function safeJsonParse(s) { try { return JSON.parse(s); } catch { return null; } }
+function clampInt(n, min, max) {
+  const x = Math.floor(Number(n));
+  if (!Number.isFinite(x)) return min;
+  return Math.max(min, Math.min(max, x));
 }
+function normalizeStr(s) { return (typeof s === "string" ? s : "").trim(); }
 
-// Normalize notes object shape
-function normalizeNotes(notes) {
-  let n = notes;
-  if (!n || typeof n !== "object" || Array.isArray(n)) n = {};
-  if (!Array.isArray(n.transcript)) n.transcript = [];
-  if (typeof n.last_updated_at !== "string") n.last_updated_at = new Date().toISOString();
-  if (typeof n.stage !== "string") n.stage = ""; // optional “state machine” stage
-  // optional slots
-  if (typeof n.business_offer !== "string") n.business_offer = "";
-  if (typeof n.primary_goal !== "string") n.primary_goal = "";
-  if (typeof n.bottleneck !== "string") n.bottleneck = "";
-  return n;
-}
-
-// Condense transcript if it gets too large
-function pruneTranscript(t, maxItems = 18) {
-  if (!Array.isArray(t)) return [];
-  return t.slice(-maxItems);
-}
-
-// Basic heuristic extraction (keeps system deterministic even if model is flaky)
-function maybeExtractSlots(notes, userMessage) {
-  const msg = String(userMessage || "").trim();
-  if (!msg) return notes;
-
-  // Simple slot fills if empty:
-  // - If user clearly answers goal question
-  const lower = msg.toLowerCase();
-
-  if (!notes.business_offer) {
-    // If first message, treat as business/offer seed
-    notes.business_offer = msg.slice(0, 280);
-  } else if (!notes.primary_goal) {
-    // If they mention leads/sales/bookings/brand explicitly, capture as goal
-    if (/(lead|leads|sale|sales|book|booking|appointments|brand|visibility|seo)/i.test(msg)) {
-      notes.primary_goal = msg.slice(0, 240);
-    }
-  } else if (!notes.bottleneck) {
-    // Common bottleneck markers
-    if (/(no time|inconsistent|follow[- ]?up|automation|content|traffic|ads|website|system|process|crm|pipeline)/i.test(lower) || msg.length >= 8) {
-      notes.bottleneck = msg.slice(0, 300);
-    }
-  }
-
+function ensureNotesShape(notesIn) {
+  const notes = (notesIn && typeof notesIn === "object") ? notesIn : {};
+  if (!Array.isArray(notes.transcript)) notes.transcript = [];
+  if (!notes.stage) notes.stage = "primary_goal";
+  if (!notes.last_updated_at) notes.last_updated_at = isoNow();
+  notes.primary_goal = notes.primary_goal ?? "";
+  notes.business_type = notes.business_type ?? "";
+  notes.bottleneck = notes.bottleneck ?? "";
+  notes.target_metric = notes.target_metric ?? "";
   return notes;
 }
 
-// Determine next question + capture intent
-function nextStep(notes) {
-  // Ask only a few questions, then capture.
-  // Stage order: business_offer -> primary_goal -> bottleneck -> capture
-  if (!notes.business_offer || notes.business_offer.trim().length < 3) {
-    return {
-      capture_intent: "none",
-      next_question: "What do you sell, and who do you sell it to? (One sentence.)",
-      stage: "business_offer"
-    };
-  }
-
-  if (!notes.primary_goal || notes.primary_goal.trim().length < 3) {
-    return {
-      capture_intent: "none",
-      next_question: "What’s the #1 goal for the next 30 days (leads, sales, bookings, brand)?",
-      stage: "primary_goal"
-    };
-  }
-
-  if (!notes.bottleneck || notes.bottleneck.trim().length < 3) {
-    return {
-      capture_intent: "none",
-      next_question: "What’s the main constraint right now—traffic, conversion, follow-up, or delivery?",
-      stage: "bottleneck"
-    };
-  }
-
-  // After 3 questions (or once we have enough), trigger intake capture
-  return {
-    capture_intent: "ask_contact",
-    next_question: "I can price this precisely. Open the intake so I can generate your executive summary and tiers?",
-    stage: "capture"
-  };
+function isLowSignalAnswer(msg) {
+  const m = normalizeStr(msg).toLowerCase();
+  if (!m) return true;
+  if (m.length <= 3) return true;
+  const low = ["ok","okay","k","cool","sounds good","how","how?","yes","yep","no","nah","idk","not sure"];
+  return low.includes(m);
 }
 
-// System prompt for Gemini — JSON only, executive tone, no marketing fluff
-function systemPrompt() {
-  return [
-    "You are Zion — an executive intelligence for Lumen Labs (AI growth systems studio).",
-    "You speak with calm, concise, high-agency executive tone.",
-    "Primary task: guide a prospect to clarify business_offer, primary_goal (30 days), and bottleneck.",
-    "Ask at most ONE question per turn. No multi-question lists.",
-    "After you have enough, set capture_intent to ask_contact.",
-    "",
-    "Output STRICT JSON ONLY with keys:",
-    `{"reply":"string","next_question":"string","capture_intent":"none|ask_contact"}`,
-    "No markdown. No code fences. No extra keys."
-  ].join("\n");
+function stageNext(stage) {
+  const order = ["primary_goal", "business_type", "target_metric", "bottleneck"];
+  const i = order.indexOf(stage);
+  return order[Math.min(order.length - 1, i + 1)] || "bottleneck";
 }
 
-async function geminiRespond({ message, notes, step }) {
-  if (!API_KEY) {
-    // Hard fallback if key is missing
-    return {
-      reply: "I’m online, but the model key is missing. I can still run deterministic intake.",
-      next_question: step.next_question,
-      capture_intent: step.capture_intent
-    };
+function shouldCapture(turn, notes) {
+  if (notes.capture_locked === true) return true;
+  if (turn >= 3) return true;
+
+  const goal = normalizeStr(notes.primary_goal);
+  const bottleneck = normalizeStr(notes.bottleneck);
+  const target = normalizeStr(notes.target_metric);
+  if (goal && (bottleneck || target) && turn >= 2) return true;
+
+  return false;
+}
+
+function buildNextQuestion(stage) {
+  switch (stage) {
+    case "primary_goal":
+      return "What’s your #1 goal for the next 30 days—leads, booked estimates, or signed contracts?";
+    case "business_type":
+      return "What type of business is this (industry + who you sell to)?";
+    case "target_metric":
+      return "What target would make this a win in 30 days (e.g., 20 leads, 10 bookings, $15k revenue)?";
+    case "bottleneck":
+    default:
+      return "What’s the biggest bottleneck right now—traffic, conversion, follow-up, or fulfillment?";
+  }
+}
+
+function buildReply(stage, message, notes) {
+  const goal = normalizeStr(notes.primary_goal);
+  const bt = normalizeStr(notes.business_type);
+  const target = normalizeStr(notes.target_metric);
+  const bottle = normalizeStr(notes.bottleneck);
+
+  switch (stage) {
+    case "primary_goal":
+      return goal ? `Understood. Goal locked: ${goal}.` : "Understood. Let’s define the target.";
+    case "business_type":
+      return bt ? `Noted. ${bt}.` : "Understood. Let’s anchor the offer and audience.";
+    case "target_metric":
+      return target ? `Good. Target locked: ${target}.` : "Understood. We need a measurable target.";
+    case "bottleneck":
+    default:
+      return bottle ? `Understood. Bottleneck noted: ${bottle}.` : "Understood. Identify the constraint so we can design the system.";
+  }
+}
+
+function updateNotesFromUser(stage, message, notes) {
+  const msg = normalizeStr(message);
+  if (!msg) return notes;
+  if (isLowSignalAnswer(msg)) return notes;
+
+  if (stage === "primary_goal" && !normalizeStr(notes.primary_goal)) {
+    notes.primary_goal = msg;
+    notes.stage = stageNext(stage);
+    return notes;
+  }
+  if (stage === "business_type" && !normalizeStr(notes.business_type)) {
+    notes.business_type = msg;
+    notes.stage = stageNext(stage);
+    return notes;
+  }
+  if (stage === "target_metric" && !normalizeStr(notes.target_metric)) {
+    notes.target_metric = msg;
+    notes.stage = stageNext(stage);
+    return notes;
+  }
+  if (stage === "bottleneck" && !normalizeStr(notes.bottleneck)) {
+    notes.bottleneck = msg;
+    notes.stage = "bottleneck";
+    return notes;
   }
 
-  const genAI = new GoogleGenerativeAI(API_KEY);
-  const model = genAI.getGenerativeModel({
-    model: MODEL,
-    systemInstruction: systemPrompt()
+  notes.extra_context = (notes.extra_context ? notes.extra_context + "\n" : "") + msg;
+  return notes;
+}
+
+async function polishWithGemini({ stage, reply, nextQuestion, notes }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return { reply, nextQuestion };
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: MODEL });
+
+  const system = [
+    "You are Zion, executive intelligence for Lumen Labs.",
+    "Return STRICT JSON only. No markdown. No code fences.",
+    "Tone: calm, decisive, concise. Avoid repetitive questions.",
+    "Do NOT say 'Received.'",
+    "Do NOT re-ask a question that is already answered in notes.",
+    "If the user response is low-signal (e.g., 'ok', 'how?'), restate the next_question sharply.",
+    "Keep reply <= 2 short sentences."
+  ].join(" ");
+
+  const prompt = JSON.stringify({
+    system,
+    stage,
+    raw_reply: reply,
+    proposed_next_question: nextQuestion,
+    notes_snapshot: {
+      stage: notes.stage,
+      primary_goal: notes.primary_goal,
+      business_type: notes.business_type,
+      target_metric: notes.target_metric,
+      bottleneck: notes.bottleneck,
+      extra_context: notes.extra_context || ""
+    }
   });
-
-  // Keep it tight: provide state + user message + the intended next question
-  const state = {
-    business_offer: notes.business_offer || "",
-    primary_goal: notes.primary_goal || "",
-    bottleneck: notes.bottleneck || "",
-    transcript_tail: (notes.transcript || []).slice(-6)
-  };
-
-  const user = String(message || "").trim();
-
-  const prompt = [
-    "STATE (authoritative):",
-    JSON.stringify(state),
-    "",
-    "USER MESSAGE:",
-    user,
-    "",
-    "INTENDED NEXT QUESTION (must be consistent unless user already answered it):",
-    step.next_question,
-    "",
-    "Respond with JSON only."
-  ].join("\n");
 
   const result = await model.generateContent(prompt);
   const text = result?.response?.text?.() || "";
   const parsed = safeJsonParse(text);
 
-  if (!parsed || typeof parsed.reply !== "string") {
-    // If Gemini fails JSON, fall back deterministically
+  if (parsed && typeof parsed.reply === "string") {
     return {
-      reply: "Understood.",
-      next_question: step.next_question,
-      capture_intent: step.capture_intent
+      reply: (parsed.reply || reply).trim(),
+      nextQuestion: (parsed.next_question || nextQuestion).trim()
     };
   }
-
-  // Coerce contract
-  const reply = String(parsed.reply || "").trim();
-  const next_question = String(parsed.next_question || "").trim() || step.next_question;
-  const capture_intent =
-    parsed.capture_intent === "ask_contact" ? "ask_contact" : step.capture_intent;
-
-  return { reply, next_question, capture_intent };
-}
-
-// IMPORTANT FIX: never allow "Received." to be the visible reply
-function normalizeAckReply(reply, next_question) {
-  const ackRe = /^(received\.?|ok\.?|noted\.?|got it\.?|roger\.?)$/i;
-  const r = String(reply || "").trim();
-  const nq = String(next_question || "").trim();
-  if (ackRe.test(r) && nq) return `Understood.\n\n${nq}`;
-  return r || nq || "Understood.";
+  return { reply, nextQuestion };
 }
 
 export default async function handler(req, res) {
-  setCors(res);
+  const origin = req.headers.origin || "";
+  setCors(res, origin);
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
+  if (req.method === "OPTIONS") return res.status(204).end();
+
+  if (req.method === "GET") {
+    return res.status(200).json({ status: "ok", message: "Zion API is live. Use POST.", model: MODEL, build: BUILD });
   }
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method Not Allowed", build: BUILD });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const body = req.body || {};
-  const message = String(body.message || "").trim();
-  const session_id = String(body.session_id || "").trim();
-  const turnIn = Number(body.turn || 0);
-
-  // notes is an object, round-tripped
-  let notes = normalizeNotes(body.notes);
-
-  // Transcript append (always)
-  if (message) {
-    notes.transcript = pruneTranscript([
-      ...notes.transcript,
-      { turn: Math.max(0, turnIn), user: message, at: new Date().toISOString() }
-    ]);
-  }
-
-  // Deterministic slot fill (helps keep the flow stable)
-  notes = maybeExtractSlots(notes, message);
-  notes.last_updated_at = new Date().toISOString();
-
-  // Decide next step
-  const step = nextStep(notes);
-  notes.stage = step.stage;
-
-  // Generate response (Gemini, with deterministic fallback)
-  let out;
   try {
-    out = await geminiRespond({ message, notes, step });
+    const body = (typeof req.body === "string") ? safeJsonParse(req.body) : req.body;
+    const message = normalizeStr(body?.message);
+    const session_id = normalizeStr(body?.session_id) || "anon";
+    const inTurn = clampInt(body?.turn ?? 0, 0, 9999);
+    const notes = ensureNotesShape(body?.notes);
+
+    notes.transcript.push({ turn: inTurn, user: message, at: isoNow() });
+    if (notes.transcript.length > 30) notes.transcript = notes.transcript.slice(-30);
+
+    const currentStage = notes.stage || "primary_goal";
+    updateNotesFromUser(currentStage, message, notes);
+
+    const stage = notes.stage || currentStage;
+    let reply = buildReply(stage, message, notes);
+    let nextQuestion = buildNextQuestion(stage);
+
+    if (isLowSignalAnswer(message)) {
+      reply = "Understood. I need one concrete input to proceed.";
+      nextQuestion = buildNextQuestion(stage);
+    }
+
+    const outTurn = inTurn + 1;
+    let capture_intent = "none";
+
+    if (shouldCapture(outTurn, notes)) {
+      capture_intent = "ask_contact";
+      notes.capture_locked = true;
+      nextQuestion = "Open the intake form so I can generate your executive summary and tiers.";
+      reply = "Understood. Open the intake so I can generate your executive summary and service tiers.";
+    }
+
+    notes.last_updated_at = isoNow();
+
+    const polished = await polishWithGemini({ stage, reply, nextQuestion, notes });
+    reply = polished.reply || reply;
+    nextQuestion = polished.nextQuestion || nextQuestion;
+
+    return res.status(200).json({
+      reply,
+      next_question: nextQuestion,
+      capture_intent,
+      turn: outTurn,
+      notes,
+      model: MODEL,
+      build: BUILD
+    });
   } catch {
-    out = {
-      reply: "Understood.",
-      next_question: step.next_question,
-      capture_intent: step.capture_intent
-    };
+    return res.status(500).json({
+      reply: "System unstable. Try again in a moment.",
+      next_question: "What is your #1 goal for the next 30 days?",
+      capture_intent: "none",
+      turn: 1,
+      notes: { transcript: [], last_updated_at: isoNow(), stage: "primary_goal" },
+      model: MODEL,
+      build: BUILD
+    });
   }
-
-  // Apply the ACK normalization fix (this is the key for your issue)
-  const fixedReply = normalizeAckReply(out.reply, out.next_question);
-
-  // turn increments server-side for returned state
-  const turnOut = Math.max(0, Math.floor(Number.isFinite(turnIn) ? turnIn : 0)) + 1;
-
-  return res.status(200).json({
-    reply: fixedReply,
-    next_question: String(out.next_question || "").trim(),
-    capture_intent: out.capture_intent === "ask_contact" ? "ask_contact" : "none",
-    turn: turnOut,
-    notes,
-    model: MODEL,
-    build: BUILD
-  });
 }
-
