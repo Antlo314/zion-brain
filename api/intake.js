@@ -1,59 +1,53 @@
-// /api/intake.js  (V2 — GHL-first, KV-optional)
-// Fixes "Something went wrong" when KV env vars are not set.
-// Behavior:
-// 1) Always attempts to forward intake to GoHighLevel via GHL_WEBHOOK_URL (required for your use-case).
-// 2) Stores to Vercel KV ONLY if KV_REST_API_URL + KV_REST_API_TOKEN are set.
-// 3) Returns { ok:true, proposal_id } on success so the landing page can redirect to summary.
-//
-// Required env:
-//   GHL_WEBHOOK_URL
-//
-// Optional env (for durable summary fetch by pid):
-//   KV_REST_API_URL
-//   KV_REST_API_TOKEN
-//   PROPOSAL_TTL_SECONDS (default 604800 = 7 days)
+// /api/intake.js
+// Vercel Serverless Function (Node, ESM)
+// Flow:
+// 1) Receive intake payload from landing page
+// 2) Generate proposal JSON via Gemini (Zion brain rules in ZION_SYSTEM_PROMPT)
+// 3) Save proposal to Vercel KV as proposal:<pid> with TTL
+// 4) POST lead data to GHL inbound webhook (optional but recommended)
+// 5) Return { ok:true, pid, redirect_url } so frontend can navigate to /summary?pid=...
 
-function sendJson(res, status, obj) {
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+function json(res, status, obj) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify(obj));
 }
-
-function cors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+function bad(res, status, msg, extra = {}) {
+  return json(res, status, { ok: false, error: msg, ...extra });
 }
 
-function safeString(x, max = 4000) {
-  const s = (x == null ? "" : String(x));
-  return s.length > max ? s.slice(0, max) : s;
+function safeTrim(v) {
+  return typeof v === "string" ? v.trim() : "";
 }
 
-function makeId() {
-  try {
-    return (globalThis.crypto && crypto.randomUUID)
-      ? crypto.randomUUID()
-      : `p_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  } catch {
-    return `p_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  }
+function splitFullName(fullName) {
+  const s = safeTrim(fullName).replace(/\s+/g, " ");
+  if (!s) return { first_name: "", last_name: "" };
+  const parts = s.split(" ");
+  if (parts.length === 1) return { first_name: parts[0], last_name: "" };
+  return { first_name: parts[0], last_name: parts.slice(1).join(" ") };
 }
 
-// ---- KV helpers (Upstash/Vercel KV REST) ----
+function makePid() {
+  // short, URL-safe id
+  return Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+}
+
 async function kvPipeline(cmds) {
   const url = process.env.KV_REST_API_URL;
   const token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) throw new Error("KV env not set");
-
+  if (!url || !token) throw new Error("KV env not set (KV_REST_API_URL / KV_REST_API_TOKEN)");
   const endpoint = url.replace(/\/$/, "") + "/pipeline";
+
   const r = await fetch(endpoint, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json"
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify(cmds)
+    body: JSON.stringify(cmds),
   });
 
   const data = await r.json().catch(() => null);
@@ -64,122 +58,215 @@ async function kvPipeline(cmds) {
   return data;
 }
 
-async function kvSetJson(key, obj, ttlSeconds) {
-  const value = JSON.stringify(obj);
-  const cmds = ttlSeconds
-    ? [{ command: ["SET", key, value, "EX", String(ttlSeconds)] }]
-    : [{ command: ["SET", key, value] }];
-  await kvPipeline(cmds);
+async function kvSetJsonWithTTL(key, obj, ttlSeconds) {
+  const val = JSON.stringify(obj);
+  // Use SETEX so we get predictable TTL behavior.
+  // Upstash REST supports Redis commands; Vercel KV REST pipeline passes them through.
+  await kvPipeline([{ command: ["SETEX", key, String(ttlSeconds), val] }]);
+}
+
+async function callGeminiProposal({ modelName, apiKey, systemPrompt, payload }) {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: modelName });
+
+  // Hard rule: JSON only (no markdown). The summary page expects structured fields.
+  const instruction = `
+Return ONLY valid JSON. No markdown. No code fences.
+
+You must output an object shaped like:
+{
+  "executive_summary": "string",
+  "tiers": [
+    { "name": "Ignite", "monthly": 950, "activation_fee": 500, "includes": ["..."], "ideal_for": "..." },
+    { "name": "Elevate", "monthly": 1450, "activation_fee": 500, "includes": ["..."], "ideal_for": "..." },
+    { "name": "Luminary", "monthly": 2250, "activation_fee": 500, "includes": ["..."], "ideal_for": "..." }
+  ],
+  "one_off_services": [
+    { "name": "Voice Agent", "range": "$49–$150/mo + setup", "notes": "..." },
+    { "name": "Smart Site", "range": "$1k–$4k", "notes": "..." },
+    { "name": "Content Automation", "range": "$350–$2k/mo", "notes": "..." },
+    { "name": "Local SEO & Automations", "range": "$500–$1,200/mo (+ build $750–$4k)", "notes": "..." }
+  ],
+  "pricing_reasoning": "string",
+  "next_steps": ["...","..."]
+}
+`;
+
+  const prompt = [
+    { role: "user", parts: [{ text: `${systemPrompt || ""}\n\n${instruction}\n\nINTAKE_PAYLOAD:\n${JSON.stringify(payload, null, 2)}` }] },
+  ];
+
+  const result = await model.generateContent({
+    contents: prompt,
+    generationConfig: {
+      temperature: 0.4,
+      maxOutputTokens: 1200,
+    },
+  });
+
+  const text = result?.response?.text?.() || "";
+  const raw = text.trim();
+
+  // Defensive parse
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Try to recover if model accidentally wrapped with extra text
+    const first = raw.indexOf("{");
+    const last = raw.lastIndexOf("}");
+    if (first !== -1 && last !== -1 && last > first) {
+      try {
+        parsed = JSON.parse(raw.slice(first, last + 1));
+      } catch {}
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("Gemini returned non-JSON proposal");
+  }
+
+  return { parsed, raw };
+}
+
+async function postToGHL(webhookUrl, leadPayload) {
+  if (!webhookUrl) return { skipped: true };
+  const r = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(leadPayload),
+  });
+  const text = await r.text().catch(() => "");
+  return { ok: r.ok, status: r.status, body: text.slice(0, 2000) };
 }
 
 export default async function handler(req, res) {
-  cors(res);
-  if (req.method === "OPTIONS") return sendJson(res, 200, { ok: true });
-  if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "Use POST" });
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return json(res, 200, { ok: true });
 
-  let body = "";
-  req.on("data", (c) => (body += c));
-  req.on("end", async () => {
-    try {
-      const payload = body ? JSON.parse(body) : {};
-      if (!payload || typeof payload !== "object") {
-        return sendJson(res, 400, { ok: false, error: "Invalid JSON" });
-      }
+  if (req.method !== "POST") return bad(res, 405, "Use POST");
 
-      // Intake fields (front-end currently posts: name/email/business/website/industry/goal/budget/timeline/bottleneck)
-      const name = safeString(payload.name, 180);
-      const email = safeString(payload.email, 180);
-      const business = safeString(payload.business, 220);
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    const modelName = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
+    const systemPrompt = process.env.ZION_SYSTEM_PROMPT || "";
+    const ghlWebhookUrl = process.env.GHL_WEBHOOK_URL || "";
 
-      if (!name || !email || !business) {
-        return sendJson(res, 422, { ok: false, error: "Missing required fields: name, email, business" });
-      }
+    if (!apiKey) return bad(res, 500, "Missing GEMINI_API_KEY");
+    // KV env checked inside kvPipeline
 
-      const proposal_id = makeId();
-      const created_at = new Date().toISOString();
-
-      // Canonical record
-      const record = {
-        proposal_id,
-        created_at,
-        session_id: safeString(payload.session_id, 120),
-        source: safeString(payload.source, 220) || "Zion Intake",
-        intake: {
-          name,
-          email,
-          business,
-          website: safeString(payload.website, 220),
-          industry: safeString(payload.industry, 120),
-          goal: safeString(payload.goal, 120),
-          budget: safeString(payload.budget, 60),
-          timeline: safeString(payload.timeline, 60),
-          bottleneck: safeString(payload.bottleneck, 1500)
-        },
-        zion_notes: payload.zion_notes || null,
-        executive_intake_summary: safeString(payload.executive_intake_summary, 12000),
-        proposal: payload.proposal || null
-      };
-
-      // 1) REQUIRED: forward to GHL webhook
-      const ghUrl = process.env.GHL_WEBHOOK_URL;
-      if (!ghUrl) {
-        return sendJson(res, 500, { ok: false, error: "Missing env var: GHL_WEBHOOK_URL" });
-      }
-
-      const ghPayload = {
-        // Flatten for easy mapping in GHL
-        name: record.intake.name,
-        email: record.intake.email,
-        business: record.intake.business,
-        website: record.intake.website,
-        industry: record.intake.industry,
-        goal: record.intake.goal,
-        budget: record.intake.budget,
-        timeline: record.intake.timeline,
-        bottleneck: record.intake.bottleneck,
-
-        proposal_id: record.proposal_id,
-        session_id: record.session_id,
-        source: record.source,
-        submitted_at: record.created_at,
-
-        executive_intake_summary: record.executive_intake_summary,
-        zion_notes: record.zion_notes,
-
-        tags: ["Zion Intake", "Zion Proposal"]
-      };
-
-      const ghRes = await fetch(ghUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(ghPayload)
-      });
-
-      if (!ghRes.ok) {
-        const ghText = await ghRes.text().catch(() => "");
-        return sendJson(res, 502, {
-          ok: false,
-          error: "GHL webhook rejected the request",
-          details: safeString(ghText, 600)
-        });
-      }
-
-      // 2) OPTIONAL: KV store for summary page fetch by pid
-      const hasKV = !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
-      if (hasKV) {
-        const ttl = Number(process.env.PROPOSAL_TTL_SECONDS || "604800");
-        try {
-          await kvSetJson(`proposal:${proposal_id}`, record, ttl);
-        } catch {
-          // Do not fail the user if KV is down; GHL already received the payload.
-        }
-      }
-
-      // Return success
-      return sendJson(res, 200, { ok: true, proposal_id });
-
-    } catch (e) {
-      return sendJson(res, 500, { ok: false, error: e?.message || "Server error" });
+    // Vercel parses JSON body automatically in many cases,
+    // but we also handle raw string body safely.
+    let body = req.body;
+    if (typeof body === "string") {
+      try { body = JSON.parse(body); } catch { body = {}; }
     }
-  });
+    body = body && typeof body === "object" ? body : {};
+
+    // Normalize fields coming from your intake modal
+    const full_name = safeTrim(body.full_name || body.name || body.fullName || "");
+    const email = safeTrim(body.email || "");
+    const phone = safeTrim(body.phone || "");
+    const business_name = safeTrim(body.business_name || body.businessName || "");
+    const website = safeTrim(body.website || "");
+    const industry = safeTrim(body.industry || "");
+    const primary_goal = safeTrim(body.primary_goal || body.primaryGoal || "");
+    const budget_range = safeTrim(body.budget_range || body.budgetRange || "");
+    const timeline = safeTrim(body.timeline || "");
+    const bottleneck = safeTrim(body.bottleneck || body.primary_bottleneck || "");
+    const intent = safeTrim(body.intent || "Zion Activation");
+    const page_url = safeTrim(body.page_url || body.pageUrl || "");
+    const conversation_summary = safeTrim(body.conversation_summary || body.conversationSummary || "");
+    const session_id = safeTrim(body.session_id || body.sessionId || "");
+
+    if (!email) return bad(res, 400, "Missing email (required)");
+
+    const { first_name, last_name } = splitFullName(full_name);
+
+    const pid = makePid();
+    const created_at = new Date().toISOString();
+
+    const intakeRecord = {
+      pid,
+      created_at,
+      full_name,
+      first_name,
+      last_name,
+      email,
+      phone,
+      business_name,
+      website,
+      industry,
+      primary_goal,
+      budget_range,
+      timeline,
+      bottleneck,
+      intent,
+      page_url,
+      conversation_summary,
+      session_id,
+      source: "Zion On-Page Intelligence",
+    };
+
+    // 1) Generate proposal via Gemini
+    const { parsed: proposal, raw: proposal_raw } = await callGeminiProposal({
+      modelName,
+      apiKey,
+      systemPrompt,
+      payload: intakeRecord,
+    });
+
+    // 2) Save to KV (TTL)
+    // Recommended: 7 days. You can change this later.
+    const TTL_SECONDS = 60 * 60 * 24 * 7;
+
+    const kvRecord = {
+      pid,
+      created_at,
+      model: modelName,
+      intake: intakeRecord,
+      proposal,
+      // keep raw for debugging (optional)
+      proposal_raw,
+    };
+
+    await kvSetJsonWithTTL(`proposal:${pid}`, kvRecord, TTL_SECONDS);
+
+    // 3) Send lead to GHL (so your workflow can create/update contact + opportunity)
+    const ghlPayload = {
+      first_name,
+      last_name,
+      email,
+      phone,
+      intent,
+      conversation_summary: conversation_summary || proposal?.pricing_reasoning || "",
+      source: "Zion On-Page Intelligence",
+      page_url,
+      proposal_id: pid,
+
+      // include full intake details for mapping or notes
+      business_name,
+      website,
+      industry,
+      primary_goal,
+      budget_range,
+      timeline,
+      bottleneck,
+      session_id,
+    };
+
+    const ghlResult = await postToGHL(ghlWebhookUrl, ghlPayload);
+
+    // 4) Respond with pid + redirect target
+    return json(res, 200, {
+      ok: true,
+      pid,
+      redirect_url: `/summary?pid=${encodeURIComponent(pid)}`,
+      ghl: ghlResult,
+    });
+  } catch (e) {
+    return bad(res, 500, e?.message || "Server error");
+  }
 }
