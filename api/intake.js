@@ -1,22 +1,31 @@
 // /api/intake.js
-// Intake -> GHL webhook -> Gemini proposal (strict JSON) -> KV store -> return pid + redirect
+// Vercel Serverless Function (Node, ESM)
+// Intake submission -> create/update contact in GoHighLevel via inbound webhook
+// -> generate strict JSON proposal via Gemini -> store in Vercel KV -> return pid + redirect URL
 //
-// Required env:
+// Required env vars:
 //   GEMINI_API_KEY
-//   GEMINI_MODEL (e.g. gemini-3-pro-preview)
-//   GHL_WEBHOOK_URL
-//   KV_REST_API_URL
-//   KV_REST_API_TOKEN
+//   GEMINI_MODEL                  (default: gemini-3-pro-preview)
+//   GHL_WEBHOOK_URL               (your GHL Inbound Webhook URL)
+//   KV_REST_API_URL               (Vercel KV / Upstash REST URL)
+//   KV_REST_API_TOKEN             (Vercel KV / Upstash REST token)
+//
+// Notes:
+// - KV uses REST /pipeline with ARRAY-OF-ARRAYS command format.
+// - Proposal TTL defaults to 30 minutes (1800s). Change PROPOSAL_TTL_SECONDS if desired.
+// - This endpoint expects JSON body with at least: email. Optional: full_name, phone, etc.
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-function json(res, status, obj) {
+const PROPOSAL_TTL_SECONDS = 1800;
+
+function sendJson(res, status, obj) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify(obj));
 }
 function bad(res, status, msg, extra = {}) {
-  return json(res, status, { ok: false, error: msg, ...extra });
+  return sendJson(res, status, { ok: false, error: msg, ...extra });
 }
 
 async function readJson(req) {
@@ -27,35 +36,54 @@ async function readJson(req) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-async function kvPipeline(cmds) {
+// -------------------- KV (Vercel KV / Upstash) --------------------
+async function kvPipeline(commands) {
   const url = process.env.KV_REST_API_URL;
   const token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) throw new Error("KV env not set");
+  if (!url || !token) throw new Error("KV env not set (KV_REST_API_URL / KV_REST_API_TOKEN)");
+
   const endpoint = url.replace(/\/$/, "") + "/pipeline";
+
+  // IMPORTANT: Upstash/Vercel KV pipeline expects an ARRAY OF ARRAYS
+  // Example: [ ["GET","key"], ["TTL","key"] ]
   const r = await fetch(endpoint, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify(cmds)
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(commands)
   });
+
   const data = await r.json().catch(() => null);
   if (!r.ok) throw new Error(`KV pipeline failed: ${data ? JSON.stringify(data) : `HTTP ${r.status}`}`);
   return data;
 }
 
-async function kvSetJson(key, obj, ttlSeconds = 1800) {
+async function kvSetJson(key, obj, ttlSeconds = PROPOSAL_TTL_SECONDS) {
   const val = JSON.stringify(obj);
   await kvPipeline([
-    { command: ["SET", key, val] },
-    { command: ["EXPIRE", key, String(ttlSeconds)] }
+    ["SET", key, val],
+    ["EXPIRE", key, String(ttlSeconds)]
   ]);
 }
 
+// -------------------- Helpers --------------------
 function makePid() {
-  // short-ish pid, good enough
-  return Math.random().toString(16).slice(2, 10).toUpperCase();
+  const rand = Math.random().toString(16).slice(2, 10).toUpperCase();
+  return rand;
 }
 
-// --- JSON hardening helpers ---
+function splitName(fullName) {
+  const full = (fullName || "").trim();
+  if (!full) return { first_name: "", last_name: "" };
+  const parts = full.split(/\s+/).filter(Boolean);
+  return {
+    first_name: parts[0] || "",
+    last_name: parts.slice(1).join(" ") || ""
+  };
+}
+
 function extractFirstJsonObject(text) {
   if (!text) return null;
   const start = text.indexOf("{");
@@ -66,62 +94,65 @@ function extractFirstJsonObject(text) {
 }
 
 function validateProposalShape(obj) {
-  // Minimal validation so bad shapes don’t silently pass.
   if (!obj || typeof obj !== "object") return false;
-  if (!obj.executive_summary || typeof obj.executive_summary !== "string") return false;
+  if (typeof obj.executive_summary !== "string" || !obj.executive_summary.trim()) return false;
   if (!Array.isArray(obj.tiers) || obj.tiers.length !== 3) return false;
   for (const t of obj.tiers) {
     if (!t || typeof t !== "object") return false;
-    if (!t.name || typeof t.name !== "string") return false;
-    if (typeof t.price_monthly !== "number") return false;
+    if (typeof t.name !== "string" || !t.name.trim()) return false;
+    const mp =
+      (typeof t.monthly_price === "number") ? t.monthly_price :
+      (typeof t.price_monthly === "number") ? t.price_monthly :
+      null;
+    if (mp === null) return false;
     if (!Array.isArray(t.scope)) return false;
   }
   return true;
 }
 
 function proposalSchemaText() {
-  // Keep it as plain text schema; Gemini follows this well when reinforced.
   return `
-Return ONLY a valid JSON object matching this schema. No markdown. No commentary.
+Return ONLY valid JSON matching this schema. No markdown. No commentary.
 
 {
-  "executive_summary": "string (5-10 sentences, executive tone)",
+  "executive_summary": "string (5–8 sentences, executive tone)",
   "pricing_logic": {
     "temperature": "Cold|Warm|Hot",
-    "recommended_plan": "Ignite|Elevate|Luminary|None",
-    "reasoning": ["string", "..."]
+    "complexity": "Simple|Moderate|Advanced",
+    "recommended_focus": "Full System|Hybrid|One-Off First",
+    "reasoning": "string (concise)"
   },
   "tiers": [
     {
       "name": "Ignite",
-      "price_monthly": 950,
+      "monthly_price": 950,
       "activation_fee": 500,
-      "why_fit": "string",
+      "ideal_for": "string",
       "scope": ["string", "..."],
       "timeline": "string"
     },
     {
       "name": "Elevate",
-      "price_monthly": 1450,
+      "monthly_price": 1450,
       "activation_fee": 500,
-      "why_fit": "string",
+      "ideal_for": "string",
       "scope": ["string", "..."],
       "timeline": "string"
     },
     {
       "name": "Luminary",
-      "price_monthly": 2250,
+      "monthly_price": 2250,
       "activation_fee": 500,
-      "why_fit": "string",
+      "ideal_for": "string",
       "scope": ["string", "..."],
       "timeline": "string"
     }
   ],
-  "one_offs": [
-    { "name": "Voice Agent", "from_monthly": 150, "setup_from": 497, "notes": "string" },
-    { "name": "Content Automation", "from_monthly": 350, "setup_from": 500, "notes": "string" },
-    { "name": "Smart Site", "from_monthly": 0, "setup_from": 1000, "notes": "string" },
-    { "name": "Local SEO", "from_monthly": 500, "setup_from": 750, "notes": "string" }
+  "one_off_services": [
+    { "name": "Voice Agent", "pricing": "$150+/mo + setup", "use_case": "string" },
+    { "name": "Smart Site", "pricing": "$1k–$4k build", "use_case": "string" },
+    { "name": "Content Automation", "pricing": "$350–$2k/mo", "use_case": "string" },
+    { "name": "Local SEO & Automations", "pricing": "$500–$1,200/mo + build", "use_case": "string" }
   ],
   "next_steps": ["string", "..."]
 }
@@ -129,44 +160,44 @@ Return ONLY a valid JSON object matching this schema. No markdown. No commentary
 }
 
 function buildProposalPrompt(payload) {
-  const {
-    full_name, email, phone, business_name, website,
-    industry, primary_goal, budget_range, timeline, bottleneck,
-    intent, page_url, conversation_summary
-  } = payload;
-
   return `
-You are Zion, executive intelligence for Lumen Labs (AI growth systems studio).
-Your task: generate a pricing-aware executive summary and 3-tier proposal for the lead.
+You are Zion — executive intelligence for Lumen Labs (AI growth systems studio).
 
-Hard rules:
-- Output must be JSON only. No markdown. No code fences. No extra keys.
-- Use Lumen Labs locked pricing:
-  Ignite $950/mo, Elevate $1,450/mo, Luminary $2,250/mo
-  Activation Fee: $500 (one-time)
-- Always return exactly 3 tiers (Ignite/Elevate/Luminary) and include one_offs options.
-- Write like an executive operator: concise, specific, no hype.
+TASK:
+Generate a structured proposal for the lead using the intake data below.
 
-Lead intake:
-full_name: ${full_name || ""}
-email: ${email || ""}
-phone: ${phone || ""}
-business_name: ${business_name || ""}
-website: ${website || ""}
-industry: ${industry || ""}
-primary_goal: ${primary_goal || ""}
-budget_range: ${budget_range || ""}
-timeline: ${timeline || ""}
-bottleneck: ${bottleneck || ""}
-intent: ${intent || ""}
-page_url: ${page_url || ""}
-conversation_summary: ${conversation_summary || ""}
+CRITICAL OUTPUT RULES (MANDATORY):
+- Output VALID JSON ONLY.
+- No markdown, no code fences, no commentary, no trailing text.
+- The response must be directly JSON.parse() compatible.
+
+LUMEN LABS LOCKED PRICING (DO NOT CHANGE):
+Activation Fee (one-time): $500
+Monthly Plans:
+- Ignite: $950/mo
+- Elevate: $1,450/mo
+- Luminary: $2,250/mo
+
+One-Off / Modular Services (optional alternatives):
+- Voice Agent: $150+/mo (+ setup)
+- Smart Site: $1,000–$4,000 build
+- Content Automation: $350–$2,000/mo
+- Local SEO & Automations: $500–$1,200/mo (+ build)
+
+GOAL:
+- Write an executive summary tailored to the intake.
+- Provide 3 tiers (Ignite/Elevate/Luminary) with clear differentiation.
+- Include a pricing_logic block that explains fit succinctly (no hype).
+- Include one_off_services options (4 items as in schema).
+
+INTAKE JSON:
+${JSON.stringify(payload, null, 2)}
 
 ${proposalSchemaText()}
 `.trim();
 }
 
-async function generateProposalStrict(payload) {
+async function generateProposalStrict(intakePayload) {
   const apiKey = process.env.GEMINI_API_KEY;
   const modelName = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
   if (!apiKey) throw new Error("GEMINI_API_KEY missing");
@@ -174,32 +205,28 @@ async function generateProposalStrict(payload) {
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
     model: modelName,
-    // If this SDK/version supports it, it helps; if ignored, no harm.
     generationConfig: {
       temperature: 0.2,
       topP: 0.9,
-      maxOutputTokens: 1400,
-      // Some Gemini endpoints honor this (forces JSON). If not honored, our parser still handles it.
+      maxOutputTokens: 1600,
       responseMimeType: "application/json"
     }
   });
 
-  // Attempt 1
-  const prompt = buildProposalPrompt(payload);
-  const r1 = await model.generateContent(prompt);
+  const prompt1 = buildProposalPrompt(intakePayload);
+  const r1 = await model.generateContent(prompt1);
   const t1 = (r1?.response?.text?.() || "").trim();
 
-  // Try strict parse
   let obj = null;
   try { obj = JSON.parse(t1); } catch { obj = extractFirstJsonObject(t1); }
-  if (obj && validateProposalShape(obj)) return { obj, raw: t1 };
+  if (obj && validateProposalShape(obj)) return { proposal: obj, raw: t1 };
 
-  // Attempt 2 (repair): feed the bad output back and demand corrected JSON only
   const repairPrompt = `
-You produced invalid JSON.
+You returned invalid JSON.
 
 Return ONLY valid JSON matching the schema exactly. No markdown. No commentary.
-Here is your previous output:
+
+Your previous output:
 ${t1}
 
 ${proposalSchemaText()}
@@ -209,34 +236,28 @@ ${proposalSchemaText()}
   const t2 = (r2?.response?.text?.() || "").trim();
 
   try { obj = JSON.parse(t2); } catch { obj = extractFirstJsonObject(t2); }
-  if (obj && validateProposalShape(obj)) return { obj, raw: t2 };
+  if (obj && validateProposalShape(obj)) return { proposal: obj, raw: t2 };
 
-  // Give caller both raw outputs for debugging
   const err = new Error("Gemini returned non-JSON proposal");
   err.raw1 = t1;
   err.raw2 = t2;
   throw err;
 }
 
-async function sendToGHL(payload) {
+async function postToGHLWebhook(intakePayload) {
   const url = process.env.GHL_WEBHOOK_URL;
   if (!url) throw new Error("GHL_WEBHOOK_URL missing");
 
-  // Your workflow mapping expects first_name/last_name/email/phone + extras (as seen in your mapping reference).
-  const full = (payload.full_name || "").trim();
-  const parts = full.split(/\s+/).filter(Boolean);
-  const first_name = parts[0] || "";
-  const last_name = parts.slice(1).join(" ") || "";
-
+  const { first_name, last_name } = splitName(intakePayload.full_name || intakePayload.name || "");
   const ghlPayload = {
     first_name,
     last_name,
-    email: (payload.email || "").trim(),
-    phone: (payload.phone || "").trim(),
-    intent: payload.intent || "Zion Activation",
-    conversation_summary: payload.conversation_summary || "",
-    source: "Zion On-Page Intelligence",
-    page_url: payload.page_url || ""
+    email: (intakePayload.email || "").trim(),
+    phone: (intakePayload.phone || "").trim(),
+    intent: intakePayload.intent || "Zion Activation",
+    conversation_summary: intakePayload.conversation_summary || "",
+    source: intakePayload.source || "Zion On-Page Intelligence",
+    page_url: intakePayload.page_url || intakePayload.url || ""
   };
 
   const r = await fetch(url, {
@@ -245,7 +266,6 @@ async function sendToGHL(payload) {
     body: JSON.stringify(ghlPayload)
   });
 
-  // Even if workflow runs async, we just need a successful POST.
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
     throw new Error(`GHL webhook failed: HTTP ${r.status} ${txt}`.trim());
@@ -253,12 +273,13 @@ async function sendToGHL(payload) {
   return { ok: true };
 }
 
+// -------------------- Handler --------------------
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") return json(res, 200, { ok: true });
+  if (req.method === "OPTIONS") return sendJson(res, 200, { ok: true });
   if (req.method !== "POST") return bad(res, 405, "Use POST");
 
   const body = await readJson(req);
@@ -269,47 +290,56 @@ export default async function handler(req, res) {
 
   const pid = makePid();
 
+  const intake = {
+    full_name: body.full_name || body.name || "",
+    email,
+    phone: body.phone || "",
+    business_name: body.business_name || body.business || "",
+    website: body.website || "",
+    industry: body.industry || "",
+    primary_goal: body.primary_goal || body.goal || "",
+    budget_range: body.budget_range || body.budget || "",
+    timeline: body.timeline || "",
+    bottleneck: body.bottleneck || "",
+    intent: body.intent || "Zion Activation",
+    conversation_summary: body.conversation_summary || "",
+    source: body.source || "Zion On-Page Intelligence",
+    page_url: body.page_url || "",
+    zion_notes: body.zion_notes || body.notes || null
+  };
+
   try {
-    // 1) Create/update contact in GHL immediately
-    await sendToGHL(body);
+    await postToGHLWebhook(intake);
 
-    // 2) Generate proposal JSON (strict)
-    const { obj: proposal, raw } = await generateProposalStrict(body);
+    const { proposal } = await generateProposalStrict(intake);
 
-    // 3) Store record in KV (30 min TTL typical; adjust as needed)
     const record = {
       pid,
       created_at: new Date().toISOString(),
-      intake: body,
+      intake,
       proposal
     };
-    await kvSetJson(`proposal:${pid}`, record, 1800);
 
-    return json(res, 200, {
+    await kvSetJson(`proposal:${pid}`, record, PROPOSAL_TTL_SECONDS);
+
+    return sendJson(res, 200, {
       ok: true,
       pid,
-      redirect_url: `/summary?pid=${encodeURIComponent(pid)}`,
-      // helpful in development; safe to remove later
-      debug: { stored: true }
+      redirect_url: `/summary?pid=${encodeURIComponent(pid)}`
     });
+
   } catch (e) {
-    // Optional: store failure debug to KV so you can inspect what Gemini returned
     try {
-      await kvSetJson(
-        `proposal_fail:${pid}`,
-        {
-          pid,
-          created_at: new Date().toISOString(),
-          intake: body,
-          error: e?.message || String(e),
-          raw1: e?.raw1 || null,
-          raw2: e?.raw2 || null
-        },
-        1800
-      );
+      await kvSetJson(`proposal_fail:${pid}`, {
+        pid,
+        created_at: new Date().toISOString(),
+        intake,
+        error: e?.message || String(e),
+        raw1: e?.raw1 || null,
+        raw2: e?.raw2 || null
+      }, PROPOSAL_TTL_SECONDS);
     } catch {}
 
     return bad(res, 500, e?.message || "Server error");
   }
 }
-
